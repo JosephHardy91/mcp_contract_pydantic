@@ -92,11 +92,15 @@ class RecordSearchTool(ToolBase[EntityBase | list[EntityBase], T_Output]):
             
             # Grab the mapping dictionary for this specific entity
             mapping = self.entity_field_mappings[entity_type]
+            print(f"DEBUG: Mapping for {entity_type}: {mapping}")
 
             # Iterate through the mapping and extract the values
             for entity_attr, query_param in mapping.items():
                 # Extract the value from the entity (e.g., entity.id)
                 val = getattr(entity, entity_attr, None)
+
+                # 2. Print exactly what we are checking
+                print(f"DEBUG: Checking attribute '{entity_attr}' on {entity_type} -> Found: '{val}'")
                 
                 # If a value exists, append it to the query parameters
                 if val is not None:

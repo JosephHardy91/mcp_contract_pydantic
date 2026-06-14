@@ -3,7 +3,7 @@ from .exploration_agent import make_agent as make_explorer_agent
 from .entities import hydrate_entity, VALID_SEARCH_ENTITIES
 from pydantic_ai import Tool, RunContext
 from typing import Any
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart
 
 
 
@@ -114,7 +114,7 @@ def get_unlocked_tools(
             
             can_unlock = any(req in owned_entity_types for req in accepted)
             
-            if is_boot or can_unlock:
+            if not is_boot and can_unlock:
                 # Rebuild the nested dictionary structure for the unlocked tool
                 if domain not in unlocked_matrix:
                     unlocked_matrix[domain] = {}
@@ -124,18 +124,38 @@ def get_unlocked_tools(
     return unlocked_matrix
 
 def make_tool_wrapper(backend_instance: ToolBase):
-    """Factory keeps the specific instance isolated from the Python loop binding."""
-    def wrapper(
-        ctx: RunContext[GraphDependencies], 
-        source_entities: list[VALID_SEARCH_ENTITIES] # type: ignore
-    ) -> list[dict[str, Any]]:
-        # Calls search on your pre-instantiated singleton
-        results = backend_instance.search(source_entities)
-        
-        if not results:
+    """
+    Wraps the tool execution to handle the conversion between 
+    JSON (from LLM) and Pydantic Objects (for your tool logic).
+    """
+    def wrapper(ctx: RunContext[GraphDependencies]) -> list[dict[str, Any]]:
+        print(f"TOOL INVOKED: {backend_instance.__class__.__name__}")
+        accepted_entities = set(getattr(backend_instance, "accepted_entities", []))
+        data_source = getattr(backend_instance, "data_source", [])
+        target_entity_type = type(data_source[0]).__name__ if data_source else None
+
+        hydrated_entities = [
+            entity
+            for entity in ctx.deps.current_inventory
+            if type(entity).__name__ in accepted_entities and type(entity).__name__ != target_entity_type
+        ]
+
+        if not hydrated_entities:
+            hydrated_entities = [
+                entity
+                for entity in ctx.deps.current_inventory
+                if type(entity).__name__ in accepted_entities
+            ]
+
+        if not hydrated_entities:
             return []
-        return [r.model_dump() for r in results]
         
+        # 2. EXECUTION: Pass the real objects to your search method
+        results = backend_instance.search(hydrated_entities)
+        
+        # 3. SERIALIZATION: Convert back to dicts for the LLM
+        return [r.model_dump() for r in results] if results else []
+    
     return wrapper
 
 def build_agent_tools(backend_matrix: dict[str, dict[str, ToolBase]]) -> list[Tool]:
@@ -154,6 +174,7 @@ def build_agent_tools(backend_matrix: dict[str, dict[str, ToolBase]]) -> list[To
             
             # 3. Pull the description (fallback if you haven't added 'description' to ToolBase yet)
             desc = getattr(instance, "description", f"Executes the {tool_name} operation for {domain}.")
+            desc = f"{desc} This tool automatically uses relevant verified entities from the current inventory."
             
             pydantic_tool = Tool(
                 execution_func,
@@ -212,6 +233,26 @@ def bootstrap_inventory(
             
     return new_inventory
 
+
+def bootstrap_full_inventory(backend_matrix: dict[str, dict[str, Any]]) -> list[Any]:
+    """Seeds exploration with full domain snapshots when no fuzzy entity was extracted."""
+    seeded_inventory = []
+
+    print("🔍 [Bootstrap] No seed entities extracted; hydrating full domain snapshots...")
+    for domain, domain_tools in backend_matrix.items():
+        bootstrapper = next(
+            (tool for tool in domain_tools.values() if getattr(tool, "is_bootstrapper", False)),
+            None,
+        )
+
+        if bootstrapper:
+            concrete_records = list(getattr(bootstrapper, "data_source", []))
+            if concrete_records:
+                seeded_inventory.extend(concrete_records)
+                print(f"   ✅ Seeded {len(concrete_records)} {domain} records.")
+
+    return seeded_inventory
+
 async def tick_tock_exploration_loop(user_prompt: str):
     inventory: list[EntityBase] = []
     chat_history: list[ModelMessage] = []
@@ -231,6 +272,7 @@ async def tick_tock_exploration_loop(user_prompt: str):
             f"{type(e).__name__}(id={getattr(e, 'id', 'Unknown')})" 
             for e in inventory
         ]
+
         
         extract_prompt = (
             f"USER PROMPT: {user_prompt}\n"
@@ -244,12 +286,19 @@ async def tick_tock_exploration_loop(user_prompt: str):
         
         # Hydrate the fuzzy JSON into strict Pydantic models using your RapidFuzz bootstrappers
         new_records = bootstrap_inventory(extraction_result.output, backend_matrix)
+        if not inventory and not new_records:
+            new_records = bootstrap_full_inventory(backend_matrix)
         
         # Add newly discovered records to the inventory
         for record in new_records:
             if not any(getattr(e, "id", None) == getattr(record, "id", None) for e in inventory):
                 inventory.append(record)
                 print(f"   ✅ Added {type(record).__name__} to inventory.")
+
+        print([
+            f"{type(e).__name__}(id={getattr(e, 'id', 'Unknown')})" 
+            for e in inventory
+        ])
 
         # ==========================================
         # PHASE 2: EXPLORE (The Graph Tock)
@@ -265,38 +314,63 @@ async def tick_tock_exploration_loop(user_prompt: str):
         
         # Run the Explorer Agent, passing the chat history forward so it remembers previous tocks
         explorer_agent = make_explorer_agent(active_tools)
+        @explorer_agent.system_prompt
+        def get_explorer_system_prompt(ctx: RunContext[GraphDependencies])->str:
+            inv_str = "\n".join(
+                f"- {e}"
+                for e in ctx.deps.current_inventory
+            )
+            print(inv_str)
+            return (
+                "You are the Exploration Phase. You traverse a strict data graph.\n"
+                f"YOUR CURRENT INVENTORY:\n{inv_str}\n\n"
+                """Inventory entities are VERIFIED facts already discovered.
+
+                A tool should only be called if it can produce a NEW entity type
+                or NEW relationships not already present in the inventory.
+
+                Before calling a tool, ask:
+                1. What new information could this tool discover?
+                2. Is that information already represented in inventory?
+
+                If no new entities or relationships would be produced,
+                do not call the tool."""
+            )
+        
         explore_result = await explorer_agent.run(
             user_prompt, 
             deps=deps,
             message_history=chat_history
         )
-        
+
+                
         # Update the chat history for the next loop
-        chat_history = explore_result.new_messages()
+        chat_history.extend(explore_result.new_messages())
         
         # ==========================================
         # PHASE 3: EVALUATE 
         # ==========================================
-        # If the Explorer didn't use any tools, it means it generated a final text answer for the user!
-        called_any_tools = any(
-            msg.kind == 'tool-call' 
+        executed_tool_returns: list[ToolReturnPart] = [
+            part
             for msg in explore_result.new_messages()
-        )
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+
+        print(bool(executed_tool_returns))
         
-        if not called_any_tools:
+        if not executed_tool_returns:
             print("\n🎉 AGENT REACHED A CONCLUSION:")
             print(explore_result.output)
             break
             
         # If tools WERE used, we update the inventory with the new graph relationships it found
-        for msg in explore_result.new_messages():
-            if isinstance(msg, ModelRequest):
-                for part in msg.parts:
-                    if isinstance(part, ToolReturnPart):
-                        # part.content holds the list[dict] returned by our wrapper
-                        if isinstance(part.content, list):
-                            for raw_record in part.content:
-                                new_entity = hydrate_entity(raw_record) 
-                                if not any(getattr(e, "id", None) == getattr(new_entity, "id", None) for e in inventory):
-                                    inventory.append(new_entity)
+        for part in executed_tool_returns:
+            # part.content holds the list[dict] returned by our wrapper
+            if isinstance(part.content, list):
+                for raw_record in part.content:
+                    new_entity = hydrate_entity(raw_record) 
+                    if not any(getattr(e, "id", None) == getattr(new_entity, "id", None) for e in inventory):
+                        inventory.append(new_entity)
 
