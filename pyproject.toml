@@ -6,5 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "pydantic-ai>=1.107.0",
+    "pytest>=9.1.0",
+    "pytest-asyncio>=1.4.0",
     "rapidfuzz>=3.14.5",
 ]
