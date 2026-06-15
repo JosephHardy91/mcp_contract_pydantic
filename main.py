@@ -42,7 +42,10 @@ def run_matrix_tests():
             for tool_name, tool_instance in tool_dict.items():
                 try:
                     # Execute the search
-                    results = tool_instance.search(subject_entity)
+                    if getattr(tool_instance, "is_bootstrapper", False):
+                        results = tool_instance.search(subject_entity.model_dump())
+                    else:
+                        results = tool_instance.search(subject_entity)
                     
                     # Format the output based on what came back
                     if not results:
