@@ -387,6 +387,7 @@ To make answers defensible, the engine must:
 3. Produce stable aggregate calculations.
 4. Preserve source record IDs for every result row.
 5. Refuse to answer if an analysis requires data that is not present.
+6. Provide a sentence-based readout of what the query will do, in plain language so the LLM can validate its intent is being met by its spec.
 
 ## Failure Modes
 
