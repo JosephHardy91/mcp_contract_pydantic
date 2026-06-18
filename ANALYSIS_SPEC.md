@@ -388,6 +388,7 @@ To make answers defensible, the engine must:
 4. Preserve source record IDs for every result row.
 5. Refuse to answer if an analysis requires data that is not present.
 6. Provide a sentence-based readout of what the query will do, in plain language so the LLM can validate its intent is being met by its spec.
+7. Use a deterministic class populated from an accepted (and compatible - read, implements the necessary API to execute analysis specs) data source, so that the agent is not trying to do 8 calls to pull in 25 records per page for 200 records as a 'sample' - the llm should declare intent, double check what its spec will do then completely hand off execution to a deterministic service with an interface completed to handle the analysis spec and translate that to the data source's underlying data operation api.
 
 ## Failure Modes
 
